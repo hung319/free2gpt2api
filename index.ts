@@ -1,25 +1,24 @@
 /**
  * =================================================================================
- * Project: free2gpt-2api (Bun Production Edition)
- * Compatible: OpenAI Standard, Kilo Code, Roo Code, Cline
+ * Project: free2gpt-2api (Bun Edition - Multimodal Fix)
+ * Version: 2.2.0
+ * Fixed: "substring is not a function" error for Agents (Roo Code, Cline)
  * =================================================================================
  */
 
 // --- [1. Configuration] ---
 const CONFIG = {
   PORT: process.env.PORT || 3000,
-  API_KEY: process.env.API_KEY || "sk-free2gpt-key", // Bearer Token
+  API_KEY: process.env.API_KEY || "sk-free2gpt-key",
   
   UPSTREAM_URL: "https://chat3.free2gpt.com/api/generate",
   ORIGIN: "https://chat3.free2gpt.com",
   
-  // Danh sách model để Agent nhận diện
+  // Danh sách model gốc theo yêu cầu
   MODELS: [
-    "free2gpt-general",
-    "gpt-3.5-turbo",
-    "gpt-4o",
-    "gpt-4o-mini",
-    "claude-3-5-sonnet" // Alias cho agent thích dùng tên này
+    "free2gpt-general", // 默认模型
+    "gpt-3.5-turbo",    // 兼容性别名
+    "gpt-4o-mini"       // 兼容性别名
   ],
   DEFAULT_MODEL: "free2gpt-general",
 
@@ -31,13 +30,25 @@ const CONFIG = {
 
 // --- [2. Helper Functions] ---
 
-// Tạo IP ngẫu nhiên để bypass rate limit
+// Fix lỗi Multimodal: Trích xuất text từ content bất kể nó là String hay Array
+function extractContentText(content) {
+  if (!content) return "";
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    // Lọc lấy phần text, bỏ qua image_url (vì upstream ko hỗ trợ)
+    return content
+      .filter(item => item.type === 'text')
+      .map(item => item.text)
+      .join('\n');
+  }
+  return String(content); // Fallback
+}
+
 function generateRandomIP() {
   const r = () => Math.floor(Math.random() * 255);
   return `${r()}.${r()}.${r()}.${r()}`;
 }
 
-// Tạo chữ ký SHA-256 theo logic upstream
 async function generateSignature(timestamp, message) {
   const secretKey = ""; 
   const data = `${timestamp}:${message}:${secretKey}`;
@@ -45,7 +56,6 @@ async function generateSignature(timestamp, message) {
   return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Headers chuẩn cho CORS và API
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -59,25 +69,35 @@ async function handleChatCompletions(req) {
     const body = await req.json();
     const messages = body.messages || [];
     const lastMsg = messages[messages.length - 1];
-    const isStream = body.stream === true; // Check chính xác boolean
+    const isStream = body.stream === true;
 
     if (!lastMsg || !lastMsg.content) {
       return new Response(JSON.stringify({ error: { message: "Message content missing", type: "invalid_request_error" } }), { status: 400 });
     }
 
-    // 1. Prepare Upstream Request
+    // --- FIX QUAN TRỌNG TẠI ĐÂY ---
+    // Luôn convert content sang string trước khi xử lý tiếp
+    const cleanContent = extractContentText(lastMsg.content);
+
+    // 1. Prepare Upstream Payload
     const timestamp = Date.now();
-    const signature = await generateSignature(timestamp, lastMsg.content);
+    // Dùng cleanContent để tạo signature (tránh lỗi substring/object)
+    const signature = await generateSignature(timestamp, cleanContent);
     
-    // Upstream Payload
+    // Map lại messages, đảm bảo content gửi đi là text string
+    const cleanMessages = messages.map(m => ({ 
+      role: m.role, 
+      content: extractContentText(m.content) 
+    }));
+
     const payload = {
-      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      messages: cleanMessages,
       time: timestamp,
       pass: null,
       sign: signature
     };
 
-    // Fake Headers
+    // 2. Fake Headers
     const fakeIp = generateRandomIP();
     const headers = {
       "Authority": "chat3.free2gpt.com",
@@ -93,7 +113,7 @@ async function handleChatCompletions(req) {
       "Client-IP": fakeIp,
     };
 
-    // 2. Call Upstream
+    // 3. Call Upstream
     const upstreamRes = await fetch(CONFIG.UPSTREAM_URL, {
       method: "POST",
       headers: headers,
@@ -102,7 +122,6 @@ async function handleChatCompletions(req) {
 
     if (!upstreamRes.ok) {
       const errText = await upstreamRes.text();
-      console.error(`Upstream Error [${upstreamRes.status}]: ${errText}`);
       return new Response(JSON.stringify({ error: { message: `Upstream error: ${errText}`, code: upstreamRes.status } }), { 
         status: 502, 
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
@@ -113,7 +132,7 @@ async function handleChatCompletions(req) {
     const model = body.model || CONFIG.DEFAULT_MODEL;
     const created = Math.floor(Date.now() / 1000);
 
-    // --- CASE A: STREAM MODE (Standard OpenAI SSE) ---
+    // --- STREAM MODE ---
     if (isStream) {
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
@@ -129,7 +148,6 @@ async function handleChatCompletions(req) {
             
             const textChunk = decoder.decode(value, { stream: true });
             
-            // Format chunk chuẩn OpenAI
             const chunkData = {
               id: requestId,
               object: "chat.completion.chunk",
@@ -145,7 +163,6 @@ async function handleChatCompletions(req) {
             await writer.write(encoder.encode(`data: ${JSON.stringify(chunkData)}\n\n`));
           }
           
-          // Gửi chunk kết thúc (quan trọng cho Agent biết để dừng)
           const endChunk = {
             id: requestId,
             object: "chat.completion.chunk",
@@ -172,11 +189,9 @@ async function handleChatCompletions(req) {
       });
     }
 
-    // --- CASE B: NON-STREAM MODE (Buffering for Agents) ---
+    // --- NON-STREAM MODE (Buffering) ---
     else {
-      // Upstream trả về stream text, ta phải đọc hết rồi mới trả JSON
-      const fullText = await upstreamRes.text(); // Bun tự handle việc đọc stream thành text
-
+      const fullText = await upstreamRes.text();
       const responseData = {
         id: requestId,
         object: "chat.completion",
@@ -185,17 +200,13 @@ async function handleChatCompletions(req) {
         system_fingerprint: "fp_free2gpt",
         choices: [{
           index: 0,
-          message: {
-            role: "assistant",
-            content: fullText
-          },
+          message: { role: "assistant", content: fullText },
           finish_reason: "stop"
         }],
-        // Fake usage để tránh lỗi client validation
         usage: {
-          prompt_tokens: JSON.stringify(messages).length, 
+          prompt_tokens: cleanContent.length,
           completion_tokens: fullText.length,
-          total_tokens: JSON.stringify(messages).length + fullText.length
+          total_tokens: cleanContent.length + fullText.length
         }
       };
 
@@ -220,16 +231,14 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    // 1. CORS Preflight
     if (req.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
-    // 2. Auth Check (Bắt buộc)
     const authHeader = req.headers.get('Authorization');
     const token = authHeader ? authHeader.replace('Bearer ', '') : null;
     
-    // Allow root & models without auth logic IF needed, but standard safe practice:
+    // Auth Check
     if (url.pathname.startsWith('/v1/') && token !== CONFIG.API_KEY) {
        return new Response(JSON.stringify({ error: { message: "Invalid API Key", type: "auth_error" } }), { 
          status: 401, 
@@ -237,12 +246,12 @@ Bun.serve({
        });
     }
 
-    // 3. Routing
+    // Chat Endpoint
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       return handleChatCompletions(req);
     }
 
-    // Endpoint Models (Các tool rất hay gọi cái này đầu tiên để init)
+    // Models Endpoint (Trả về list gốc)
     if (url.pathname === '/v1/models') {
       return new Response(JSON.stringify({
         object: 'list',
@@ -250,18 +259,14 @@ Bun.serve({
           id: id,
           object: 'model',
           created: 1677610602,
-          owned_by: 'openai' // Fake owner để pass filter
+          owned_by: 'free2gpt'
         }))
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    if (url.pathname === '/') {
-      return new Response(JSON.stringify({ status: "ok", message: "Free2GPT Proxy Active" }), {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
-    }
-
-    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: corsHeaders });
+    return new Response(JSON.stringify({ status: "ok", service: "free2gpt-bun" }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
   }
 });
 
